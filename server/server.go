@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/oklog/ulid/v2"
+	"github.com/openfga/openfga/internal/dispatcher"
 	"github.com/openfga/openfga/internal/gateway"
+	"github.com/openfga/openfga/internal/graph"
 	httpmiddleware "github.com/openfga/openfga/internal/middleware/http"
 	"github.com/openfga/openfga/pkg/encoder"
 	"github.com/openfga/openfga/pkg/logger"
@@ -16,6 +18,8 @@ import (
 	"github.com/openfga/openfga/server/commands"
 	serverErrors "github.com/openfga/openfga/server/errors"
 	"github.com/openfga/openfga/storage"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	openfgapb "go.buf.build/openfga/go/openfga/api/openfga/v1"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -241,11 +245,30 @@ func (s *Server) Write(ctx context.Context, req *openfgapb.WriteRequest) (*openf
 	})
 }
 
+var (
+	httpRequestDuration = promauto.NewSummaryVec(prometheus.SummaryOpts{
+		Name: "http_request_duration_ms",
+		Help: "The duration (in ms) that an HTTP request took",
+		Objectives: map[float64]float64{
+			0.9:  0.05,
+			0.95: 0.05,
+			0.99: 0.05,
+		},
+	}, []string{"method"})
+)
+
 func (s *Server) Check(ctx context.Context, req *openfgapb.CheckRequest) (*openfgapb.CheckResponse, error) {
+	start := time.Now()
+	defer func() {
+		httpRequestDuration.With(prometheus.Labels{
+			"method": "openfga.v1.OpenFGAService/Check",
+		}).Observe(float64(time.Since(start).Milliseconds()))
+	}()
+
 	store := req.GetStoreId()
 	tk := req.GetTupleKey()
 	ctx, span := s.tracer.Start(ctx, "check", trace.WithAttributes(
-		attribute.KeyValue{Key: "store", Value: attribute.StringValue(req.GetStoreId())},
+		attribute.KeyValue{Key: "store", Value: attribute.StringValue(store)},
 		attribute.KeyValue{Key: "object", Value: attribute.StringValue(tk.GetObject())},
 		attribute.KeyValue{Key: "relation", Value: attribute.StringValue(tk.GetRelation())},
 		attribute.KeyValue{Key: "user", Value: attribute.StringValue(tk.GetUser())},
@@ -258,17 +281,30 @@ func (s *Server) Check(ctx context.Context, req *openfgapb.CheckRequest) (*openf
 	}
 	span.SetAttributes(attribute.KeyValue{Key: "authorization-model-id", Value: attribute.StringValue(modelID)})
 
-	q := commands.NewCheckQuery(s.datastore, s.tracer, s.meter, s.logger, s.config.ResolveNodeLimit)
+	model, err := s.datastore.ReadAuthorizationModel(ctx, store, modelID)
+	if err != nil {
+		return nil, err
+	}
 
-	res, err := q.Execute(ctx, &openfgapb.CheckRequest{
-		StoreId:              store,
-		TupleKey:             tk,
-		ContextualTuples:     req.GetContextualTuples(),
-		AuthorizationModelId: modelID,
-		Trace:                req.GetTrace(),
+	g := graph.NewConcurrentChecker(s.datastore, 100)
+
+	ctx = typesystem.ContextWithTypesystem(ctx, typesystem.New(model))
+
+	resp, err := g.DispatchCheck(ctx, &dispatcher.DispatchCheckRequest{
+		StoreId:              req.GetStoreId(),
+		AuthorizationModelId: req.GetAuthorizationModelId(),
+		TupleKey:             req.GetTupleKey(),
+		ContextualTuples:     req.ContextualTuples.GetTupleKeys(),
+		ResolutionMetadata: &dispatcher.ResolutionMetadata{
+			Depth: s.config.ResolveNodeLimit,
+		},
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	res := &openfgapb.CheckResponse{
+		Allowed: resp.Allowed,
 	}
 
 	span.SetAttributes(attribute.KeyValue{Key: "allowed", Value: attribute.BoolValue(res.GetAllowed())})
